@@ -3,6 +3,7 @@
 
 import frappe
 import ibis
+import pandas as pd
 from frappe.defaults import get_user_default, set_user_default
 from frappe.handler import is_valid_http_method, is_whitelisted
 from frappe.monitor import add_data_to_monitor
@@ -65,7 +66,6 @@ def get_user_info():
         "last_name": user.get("last_name"),
         "is_admin": _is_admin,
         "is_user": is_user or frappe.session.user == "Administrator",
-        # TODO: move to `get_session_info` since not user specific
         "country": frappe.db.get_single_value("System Settings", "country"),
         "locale": frappe.db.get_single_value("System Settings", "language"),
         "is_v2_instance": frappe.db.count("Insights Query") > 0,
@@ -104,14 +104,17 @@ def get_file_data(filename: str):
 
     file, ext = get_csv_file(filename)
     file_path = file.get_full_path()
-    file_name = file.file_name.split(".")[0]
-    file_name = frappe.scrub(file_name)
+    file_name = frappe.scrub(file.file_name.split(".")[0])
 
     con = ibis.duckdb.connect()
-    if ext in ["xlsx"]:
-        table = con.read_xlsx(file_path)
+
+    # ✅ PATCH: use pandas instead of DuckDB file access
+    if ext == "xlsx":
+        df = pd.read_excel(file_path)
     else:
-        table = con.read_csv(file_path, table_name=file_name)
+        df = pd.read_csv(file_path)
+
+    table = con.create_table(file_name, df)
 
     count = table.count().execute()
     columns = get_columns_from_schema(table.schema())
@@ -132,8 +135,7 @@ def import_csv_data(filename: str):
 
     file, ext = get_csv_file(filename)
     file_path = file.get_full_path()
-    table_name = file.file_name.split(".")[0]
-    table_name = frappe.scrub(table_name)
+    table_name = frappe.scrub(file.file_name.split(".")[0])
 
     if not frappe.db.exists("Insights Data Source v3", "uploads"):
         uploads = frappe.new_doc("Insights Data Source v3")
@@ -149,20 +151,30 @@ def import_csv_data(filename: str):
     db = get_duckdb_connection(ds, read_only=False)
 
     try:
-        if ext in ["xlsx"]:
-            table = db.read_xlsx(file_path)
-            db.create_table(table_name, table, overwrite=True)
+        # ✅ PATCH: use pandas instead of DuckDB read_csv
+        if ext == "xlsx":
+            df = pd.read_excel(file_path)
         else:
-            table = db.read_csv(file_path, table_name=table_name)
-            db.create_table(table_name, table, overwrite=True)
-    except Exception as e:
-        frappe.log_error(e)
-        if ext in ["xlsx"]:
+            df = pd.read_csv(file_path)
+
+        db.create_table(table_name, df, overwrite=True)
+
+    except Exception:
+        # ✅ PATCH: fix logging crash
+        frappe.log_error(
+            message=frappe.get_traceback(),
+            title="Insights CSV Import Error"
+        )
+
+        if ext == "xlsx":
             frappe.throw(
-                "Failed to read Excel data from uploaded file. Please ensure the file is a valid Excel format and try again."
+                "Failed to read Excel data from uploaded file. Please ensure the file is valid."
             )
         else:
-            frappe.throw("Failed to read CSV data from uploaded file. Please try again.")
+            frappe.throw(
+                "Failed to read CSV data from uploaded file. Please try again."
+            )
+
     finally:
         db.disconnect()
 
@@ -174,7 +186,6 @@ def import_csv_data(filename: str):
 def get_doc(doctype: str, name: str | int):
     try:
         from frappe.client import get as _get_doc
-
         return _get_doc(doctype, name)
     except frappe.PermissionError:
         if not is_public(doctype, name):
@@ -230,7 +241,4 @@ def is_public_method(doctype: str, method: str):
         "Insights Dashboard v3": ["get_distinct_column_values"],
     }
 
-    if doctype in public_methods and method in public_methods[doctype]:
-        return True
-
-    return False
+    return doctype in public_methods and method in public_methods[doctype]
